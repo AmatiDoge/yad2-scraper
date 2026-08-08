@@ -1,12 +1,15 @@
 const cheerio = require('cheerio');
-const Telenode = require('telenode-js');
 const fs = require('fs');
 const config = require('./config.json');
 
 const getYad2Response = async (url) => {
     const requestOptions = {
         method: 'GET',
-        redirect: 'follow'
+        redirect: 'follow',
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8',
+        }
     };
     try {
         const res = await fetch(url, requestOptions)
@@ -16,7 +19,7 @@ const getYad2Response = async (url) => {
     }
 }
 
-const scrapeItemsAndExtractImgUrls = async (url) => {
+const scrapeItemsAndExtractData = async (url) => {
     const yad2Html = await getYad2Response(url);
     if (!yad2Html) {
         throw new Error("Could not get Yad2 response");
@@ -24,54 +27,69 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
     const $ = cheerio.load(yad2Html);
     const title = $("title")
     const titleText = title.first().text();
-    if (titleText === "ShieldSquare Captcha") {
+    if (titleText === "ShieldSquare Captcha" || titleText.includes("Radware")) {
         throw new Error("Bot detection");
     }
-    const $feedItems = $(".feeditem").find(".pic");
-    if (!$feedItems) {
-        throw new Error("Could not find feed items");
+    const $feedItems = $(".feeditem");
+    if (!$feedItems || $feedItems.length === 0) {
+        console.log("Warning: Could not find feed items (0 results or page structure changed)");
+        return [];
     }
-    const imageUrls = []
+    const items = [];
     $feedItems.each((_, elm) => {
-        const imgSrc = $(elm).find("img").attr('src');
-        if (imgSrc) {
-            imageUrls.push(imgSrc)
+        const $item = $(elm);
+        const imgSrc = $item.find(".pic img").attr('src') || null;
+        const linkHref = $item.find("a").attr('href') || null;
+        const postUrl = linkHref
+            ? (linkHref.startsWith('http') ? linkHref : `https://www.yad2.co.il${linkHref}`)
+            : null;
+        const itemTitle = $item.find(".title").text().trim() || null;
+        const itemPrice = $item.find(".price").text().trim() || null;
+        const itemDesc = $item.find(".subtitle, .row-subtitle, .info-row").text().trim() || null;
+        // Use imgSrc as the dedup key (original behavior), postUrl for ingest
+        if (imgSrc || postUrl) {
+            items.push({ imgSrc, postUrl, title: itemTitle, price: itemPrice, description: itemDesc });
         }
-    })
-    return imageUrls;
+    });
+    return items;
 }
 
-const checkIfHasNewItem = async (imgUrls, topic) => {
+const checkIfHasNewItems = async (items, topic) => {
     const filePath = `./data/${topic}.json`;
-    let savedUrls = [];
+    let savedKeys = [];
     try {
-        savedUrls = require(filePath);
+        savedKeys = require(filePath);
     } catch (e) {
         if (e.code === "MODULE_NOT_FOUND") {
-            fs.mkdirSync('data');
+            if (!fs.existsSync('./data')) {
+                fs.mkdirSync('data');
+            }
             fs.writeFileSync(filePath, '[]');
         } else {
             console.log(e);
             throw new Error(`Could not read / create ${filePath}`);
         }
     }
+    // Use imgSrc (or postUrl as fallback) as the dedup key
+    const getKey = (item) => item.imgSrc || item.postUrl;
     let shouldUpdateFile = false;
-    savedUrls = savedUrls.filter(savedUrl => {
-        shouldUpdateFile = true;
-        return imgUrls.includes(savedUrl);
+    savedKeys = savedKeys.filter(savedKey => {
+        const stillPresent = items.some(item => getKey(item) === savedKey);
+        if (!stillPresent) shouldUpdateFile = true;
+        return stillPresent;
     });
     const newItems = [];
-    imgUrls.forEach(url => {
-        if (!savedUrls.includes(url)) {
-            savedUrls.push(url);
-            newItems.push(url);
+    items.forEach(item => {
+        const key = getKey(item);
+        if (key && !savedKeys.includes(key)) {
+            savedKeys.push(key);
+            newItems.push(item);
             shouldUpdateFile = true;
         }
     });
     if (shouldUpdateFile) {
-        const updatedUrls = JSON.stringify(savedUrls, null, 2);
-        fs.writeFileSync(filePath, updatedUrls);
-        await createPushFlagForWorkflow();
+        fs.writeFileSync(filePath, JSON.stringify(savedKeys, null, 2));
+        createPushFlagForWorkflow();
     }
     return newItems;
 }
@@ -80,27 +98,89 @@ const createPushFlagForWorkflow = () => {
     fs.writeFileSync("push_me", "")
 }
 
+const forwardToIngest = async (newItems, topicUrl) => {
+    const ingestUrl = process.env.INGEST_URL;
+    const ingestSecret = process.env.INGEST_SECRET;
+    if (!ingestUrl) {
+        console.log("INGEST_URL not set, skipping forward to ingest");
+        return;
+    }
+    const posts = newItems.map(item => ({
+        source: "yad2",
+        group_name: null,
+        post_url: item.postUrl || topicUrl,
+        author: null,
+        raw_text: [item.title, item.price, item.description].filter(Boolean).join(" | "),
+    }));
+    if (posts.length === 0) return;
+    try {
+        const res = await fetch(ingestUrl, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-ingest-secret": ingestSecret || "",
+            },
+            body: JSON.stringify({ posts }),
+        });
+        const body = await res.text();
+        console.log(`Ingest response: ${res.status} ${body}`);
+    } catch (err) {
+        console.log("Error forwarding to ingest:", err);
+    }
+}
+
+const sendTelegram = async (apiToken, chatId, message) => {
+    if (!apiToken || !chatId) return;
+    try {
+        const url = `https://api.telegram.org/bot${apiToken}/sendMessage`;
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: message }),
+        });
+    } catch (err) {
+        console.log("Telegram send error:", err);
+    }
+}
+
 const scrape = async (topic, url) => {
     const apiToken = process.env.API_TOKEN || config.telegramApiToken;
     const chatId = process.env.CHAT_ID || config.chatId;
-    const telenode = new Telenode({apiToken})
+    const telegramEnabled = !!(apiToken && chatId);
     try {
-        await telenode.sendTextMessage(`Starting scanning ${topic} on link:\n${url}`, chatId)
-        const scrapeImgResults = await scrapeItemsAndExtractImgUrls(url);
-        const newItems = await checkIfHasNewItem(scrapeImgResults, topic);
-        if (newItems.length > 0) {
-            const newItemsJoined = newItems.join("\n----------\n");
-            const msg = `${newItems.length} new items:\n${newItemsJoined}`
-            await telenode.sendTextMessage(msg, chatId);
+        if (telegramEnabled) {
+            await sendTelegram(apiToken, chatId, `Starting scanning ${topic} on link:\n${url}`);
         } else {
-            await telenode.sendTextMessage("No new items were added", chatId);
+            console.log(`Starting scanning ${topic} on link:\n${url}`);
+        }
+        const scrapeResults = await scrapeItemsAndExtractData(url);
+        console.log(`Found ${scrapeResults.length} items on page`);
+        const newItems = await checkIfHasNewItems(scrapeResults, topic);
+        console.log(`${newItems.length} new items for topic "${topic}"`);
+        if (newItems.length > 0) {
+            // Forward new listings to Dira Finder ingest
+            await forwardToIngest(newItems, url);
+            if (telegramEnabled) {
+                const newItemsJoined = newItems.map(i => i.postUrl || i.imgSrc).join("\n----------\n");
+                const msg = `${newItems.length} new items:\n${newItemsJoined}`;
+                await sendTelegram(apiToken, chatId, msg);
+            }
+        } else {
+            if (telegramEnabled) {
+                await sendTelegram(apiToken, chatId, "No new items were added");
+            } else {
+                console.log("No new items were added");
+            }
         }
     } catch (e) {
         let errMsg = e?.message || "";
         if (errMsg) {
             errMsg = `Error: ${errMsg}`
         }
-        await telenode.sendTextMessage(`Scan workflow failed... 😥\n${errMsg}`, chatId)
+        console.log(`Scan workflow failed for ${topic}: ${errMsg}`);
+        if (telegramEnabled) {
+            await sendTelegram(apiToken, chatId, `Scan workflow failed... ${errMsg}`);
+        }
         throw new Error(e)
     }
 }
