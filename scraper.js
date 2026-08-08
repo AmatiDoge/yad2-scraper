@@ -1,199 +1,191 @@
-const cheerio = require('cheerio');
 const fs = require('fs');
 const config = require('./config.json');
 
-const getYad2Response = async (url) => {
-    const requestOptions = {
-        method: 'GET',
-        redirect: 'follow',
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8',
-        }
-    };
-    try {
-        const res = await fetch(url, requestOptions)
-        return await res.text()
-    } catch (err) {
-        console.log(err)
-    }
-}
+// ── Apify actor that handles Yad2's Radware bot protection ──────────────────
+// swerve/yad2-scraper uses residential proxies so it works from datacenter IPs.
+const APIFY_ACTOR = 'swerve~yad2-scraper';
+const APIFY_BASE = 'https://api.apify.com/v2';
+const POLL_INTERVAL_MS = 5000;
+const POLL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes max
 
-const scrapeItemsAndExtractData = async (url) => {
-    const yad2Html = await getYad2Response(url);
-    if (!yad2Html) {
-        throw new Error("Could not get Yad2 response");
-    }
-    const $ = cheerio.load(yad2Html);
-    const title = $("title")
-    const titleText = title.first().text();
-    if (titleText === "ShieldSquare Captcha" || titleText.includes("Radware")) {
-        throw new Error("Bot detection");
-    }
-    const $feedItems = $(".feeditem");
-    if (!$feedItems || $feedItems.length === 0) {
-        console.log("Warning: Could not find feed items (0 results or page structure changed)");
-        return [];
-    }
-    const items = [];
-    $feedItems.each((_, elm) => {
-        const $item = $(elm);
-        const imgSrc = $item.find(".pic img").attr('src') || null;
-        const linkHref = $item.find("a").attr('href') || null;
-        const postUrl = linkHref
-            ? (linkHref.startsWith('http') ? linkHref : `https://www.yad2.co.il${linkHref}`)
-            : null;
-        const itemTitle = $item.find(".title").text().trim() || null;
-        const itemPrice = $item.find(".price").text().trim() || null;
-        const itemDesc = $item.find(".subtitle, .row-subtitle, .info-row").text().trim() || null;
-        // Use imgSrc as the dedup key (original behavior), postUrl for ingest
-        if (imgSrc || postUrl) {
-            items.push({ imgSrc, postUrl, title: itemTitle, price: itemPrice, description: itemDesc });
-        }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const apifyRun = async (apifyToken, input) => {
+    const url = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${apifyToken}`;
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
     });
-    return items;
-}
+    const data = await res.json();
+    if (!res.ok || !data.data?.id) {
+        throw new Error(`Apify run start failed: ${JSON.stringify(data)}`);
+    }
+    return data.data.id;
+};
 
-const checkIfHasNewItems = async (items, topic) => {
+const apifyPollUntilDone = async (apifyToken, runId) => {
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        await sleep(POLL_INTERVAL_MS);
+        const res = await fetch(`${APIFY_BASE}/acts/${APIFY_ACTOR}/runs/${runId}?token=${apifyToken}`);
+        const data = await res.json();
+        const status = data.data?.status;
+        console.log(`Apify run ${runId}: ${status}`);
+        if (status === 'SUCCEEDED') return data.data.defaultDatasetId;
+        if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT') {
+            throw new Error(`Apify run ${runId} ended with status: ${status}`);
+        }
+    }
+    throw new Error(`Apify run ${runId} did not finish within ${POLL_TIMEOUT_MS / 1000}s`);
+};
+
+const apifyGetItems = async (apifyToken, datasetId) => {
+    const res = await fetch(`${APIFY_BASE}/datasets/${datasetId}/items?token=${apifyToken}&limit=200`);
+    if (!res.ok) throw new Error(`Failed to fetch dataset items: ${res.status}`);
+    return res.json();
+};
+
+const checkIfHasNewItems = (items, topic) => {
     const filePath = `./data/${topic}.json`;
-    let savedKeys = [];
+    let seenIds = [];
     try {
-        savedKeys = require(filePath);
+        seenIds = require(filePath);
     } catch (e) {
-        if (e.code === "MODULE_NOT_FOUND") {
-            if (!fs.existsSync('./data')) {
-                fs.mkdirSync('data');
-            }
+        if (e.code === 'MODULE_NOT_FOUND') {
+            if (!fs.existsSync('./data')) fs.mkdirSync('data');
             fs.writeFileSync(filePath, '[]');
         } else {
-            console.log(e);
-            throw new Error(`Could not read / create ${filePath}`);
+            throw new Error(`Could not read/create ${filePath}: ${e}`);
         }
     }
-    // Use imgSrc (or postUrl as fallback) as the dedup key
-    const getKey = (item) => item.imgSrc || item.postUrl;
-    let shouldUpdateFile = false;
-    savedKeys = savedKeys.filter(savedKey => {
-        const stillPresent = items.some(item => getKey(item) === savedKey);
-        if (!stillPresent) shouldUpdateFile = true;
-        return stillPresent;
-    });
+
+    // Filter out IDs no longer in current result set (to keep the list lean)
+    const currentIds = new Set(items.map(i => i.listingId).filter(Boolean));
+    const updatedSeenIds = seenIds.filter(id => currentIds.has(id));
+
     const newItems = [];
-    items.forEach(item => {
-        const key = getKey(item);
-        if (key && !savedKeys.includes(key)) {
-            savedKeys.push(key);
+    for (const item of items) {
+        const id = item.listingId;
+        if (id && !updatedSeenIds.includes(id)) {
+            updatedSeenIds.push(id);
             newItems.push(item);
-            shouldUpdateFile = true;
         }
-    });
-    if (shouldUpdateFile) {
-        fs.writeFileSync(filePath, JSON.stringify(savedKeys, null, 2));
-        createPushFlagForWorkflow();
     }
+
+    if (newItems.length > 0 || updatedSeenIds.length !== seenIds.length) {
+        fs.writeFileSync(filePath, JSON.stringify(updatedSeenIds, null, 2));
+        fs.writeFileSync('push_me', '');
+    }
+
     return newItems;
-}
+};
 
-const createPushFlagForWorkflow = () => {
-    fs.writeFileSync("push_me", "")
-}
-
-const forwardToIngest = async (newItems, topicUrl) => {
+const forwardToIngest = async (newItems) => {
     const ingestUrl = process.env.INGEST_URL;
     const ingestSecret = process.env.INGEST_SECRET;
     if (!ingestUrl) {
-        console.log("INGEST_URL not set, skipping forward to ingest");
+        console.log('INGEST_URL not set, skipping forward to Dira Finder ingest');
         return;
     }
-    const posts = newItems.map(item => ({
-        source: "yad2",
-        group_name: null,
-        post_url: item.postUrl || topicUrl,
-        author: null,
-        raw_text: [item.title, item.price, item.description].filter(Boolean).join(" | "),
-    }));
+    const posts = newItems.map(item => {
+        const parts = [
+            item.address,
+            item.neighbourhood,
+            item.price ? `₪${item.price}` : null,
+            item.rooms ? `${item.rooms} חד׳` : null,
+            item.areaSqm ? `${item.areaSqm}מ"ר` : null,
+            item.listingDescription,
+            item.contactPhone,
+        ].filter(Boolean);
+        return {
+            source: 'yad2',
+            group_name: null,
+            post_url: item.url,
+            author: item.contactName || null,
+            raw_text: parts.join(' | '),
+        };
+    });
     if (posts.length === 0) return;
     try {
         const res = await fetch(ingestUrl, {
-            method: "POST",
+            method: 'POST',
             headers: {
-                "content-type": "application/json",
-                "x-ingest-secret": ingestSecret || "",
+                'content-type': 'application/json',
+                'x-ingest-secret': ingestSecret || '',
             },
             body: JSON.stringify({ posts }),
         });
         const body = await res.text();
         console.log(`Ingest response: ${res.status} ${body}`);
     } catch (err) {
-        console.log("Error forwarding to ingest:", err);
+        console.log('Error forwarding to ingest:', err);
     }
-}
+};
 
 const sendTelegram = async (apiToken, chatId, message) => {
     if (!apiToken || !chatId) return;
     try {
-        const url = `https://api.telegram.org/bot${apiToken}/sendMessage`;
-        await fetch(url, {
+        await fetch(`https://api.telegram.org/bot${apiToken}/sendMessage`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ chat_id: chatId, text: message }),
         });
     } catch (err) {
-        console.log("Telegram send error:", err);
+        console.log('Telegram send error:', err);
     }
-}
+};
 
-const scrape = async (topic, url) => {
+const scrape = async (project) => {
+    const { topic, apifyInput } = project;
+    const apifyToken = process.env.APIFY_TOKEN || config.apifyToken;
     const apiToken = process.env.API_TOKEN || config.telegramApiToken;
     const chatId = process.env.CHAT_ID || config.chatId;
     const telegramEnabled = !!(apiToken && chatId);
+
+    if (!apifyToken) throw new Error('APIFY_TOKEN is required');
+
+    console.log(`Starting Apify run for topic "${topic}" with input: ${JSON.stringify(apifyInput)}`);
+    if (telegramEnabled) {
+        await sendTelegram(apiToken, chatId, `Starting Yad2 scan: ${topic}`);
+    }
+
     try {
-        if (telegramEnabled) {
-            await sendTelegram(apiToken, chatId, `Starting scanning ${topic} on link:\n${url}`);
-        } else {
-            console.log(`Starting scanning ${topic} on link:\n${url}`);
-        }
-        const scrapeResults = await scrapeItemsAndExtractData(url);
-        console.log(`Found ${scrapeResults.length} items on page`);
-        const newItems = await checkIfHasNewItems(scrapeResults, topic);
+        const runId = await apifyRun(apifyToken, apifyInput);
+        const datasetId = await apifyPollUntilDone(apifyToken, runId);
+        const items = await apifyGetItems(apifyToken, datasetId);
+        console.log(`Got ${items.length} items from Apify for topic "${topic}"`);
+
+        const newItems = checkIfHasNewItems(items, topic);
         console.log(`${newItems.length} new items for topic "${topic}"`);
+
         if (newItems.length > 0) {
-            // Forward new listings to Dira Finder ingest
-            await forwardToIngest(newItems, url);
+            await forwardToIngest(newItems);
             if (telegramEnabled) {
-                const newItemsJoined = newItems.map(i => i.postUrl || i.imgSrc).join("\n----------\n");
-                const msg = `${newItems.length} new items:\n${newItemsJoined}`;
+                const msg = `${newItems.length} new Yad2 listings:\n` +
+                    newItems.slice(0, 5).map(i => i.url).join('\n');
                 await sendTelegram(apiToken, chatId, msg);
             }
         } else {
+            console.log('No new listings');
             if (telegramEnabled) {
-                await sendTelegram(apiToken, chatId, "No new items were added");
-            } else {
-                console.log("No new items were added");
+                await sendTelegram(apiToken, chatId, `No new Yad2 listings for ${topic}`);
             }
         }
     } catch (e) {
-        let errMsg = e?.message || "";
-        if (errMsg) {
-            errMsg = `Error: ${errMsg}`
-        }
-        console.log(`Scan workflow failed for ${topic}: ${errMsg}`);
-        if (telegramEnabled) {
-            await sendTelegram(apiToken, chatId, `Scan workflow failed... ${errMsg}`);
-        }
-        throw new Error(e)
+        const msg = `Scan failed for ${topic}: ${e?.message || e}`;
+        console.log(msg);
+        if (telegramEnabled) await sendTelegram(apiToken, chatId, msg);
+        throw e;
     }
-}
+};
 
 const program = async () => {
-    await Promise.all(config.projects.filter(project => {
-        if (project.disabled) {
-            console.log(`Topic "${project.topic}" is disabled. Skipping.`);
-        }
-        return !project.disabled;
-    }).map(async project => {
-        await scrape(project.topic, project.url)
-    }))
+    const activeProjects = config.projects.filter(p => {
+        if (p.disabled) console.log(`Topic "${p.topic}" is disabled. Skipping.`);
+        return !p.disabled;
+    });
+    await Promise.all(activeProjects.map(p => scrape(p)));
 };
 
 program();

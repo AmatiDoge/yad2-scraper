@@ -1,10 +1,16 @@
 {
+  "apifyToken": null,
   "telegramApiToken": null,
   "chatId": null,
   "projects": [
     {
       "topic": "tlv-rent-3300",
-      "url": "https://www.yad2.co.il/realestate/rent?city=5000&maxPrice=3300"
+      "apifyInput": {
+        "city": "Tel Aviv",
+        "dealType": "rent",
+        "maxPrice": 3300,
+        "maxItems": 200
+      }
     }
   ]
 }

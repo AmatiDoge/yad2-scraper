@@ -2,10 +2,9 @@ name: Yad2 Scraper
 
 on:
   schedule:
-    - cron: '*/15 5-17 * * *'
+    # Run every 15 minutes (between 06:00-20:00 UTC, i.e. 08:00-22:00 IL)
+    - cron: '*/15 6-20 * * *'
   workflow_dispatch:
-    branches:
-      - '**'
 
 jobs:
   scraper:
@@ -26,10 +25,11 @@ jobs:
 
       - name: Run scraper
         env:
-          API_TOKEN: ${{ secrets.API_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         run: yarn scrape
 
       - name: Push new json data if needed
